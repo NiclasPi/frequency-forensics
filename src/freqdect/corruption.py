@@ -4,7 +4,7 @@ from io import BytesIO
 import cv2
 import numpy as np
 from PIL import Image
-from torchvision.transforms import RandomResizedCrop, RandomRotation
+from torchvision.transforms import RandomResizedCrop, RandomRotation, RandomCrop
 
 
 def jpeg_compression(image: Image) -> Image:
@@ -46,7 +46,8 @@ def random_resized_crop(image: Image) -> Image:
     Returns:
         Image: The processed output image.
     """
-    return RandomResizedCrop((image.size[1], image.size[0]), scale=(0.8, 1.0))(image)
+    #return RandomResizedCrop((image.size[1], image.size[0]), scale=(0.8, 1.0))(image)
+    return RandomCrop(128)(image)  # TODO: this is not a random resized crop anymore
 
 
 def noise(image: Image) -> Image:

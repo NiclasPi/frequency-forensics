@@ -1,0 +1,23 @@
+name: Forensics
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.6,<3.10
+  - pytorch::pytorch-cuda
+  - pytorch::pytorch
+  - tensorboard
+  - tqdm
+  - click
+  - matplotlib
+  - seaborn
+  - pywavelets
+  - scipy
+  - pillow
+  - torchvision
+  - fastai::opencv-python-headless~=4.5
+  - pip
+  - pip:
+    - ptwt==0.1.2
+#    - more_itertools
+    - more_click
+  - __cuda=12.1

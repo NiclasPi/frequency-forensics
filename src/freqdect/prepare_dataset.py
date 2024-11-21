@@ -14,7 +14,7 @@ from typing import Tuple
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 from .corruption import (
     blur,
@@ -182,21 +182,24 @@ def load_perturb_and_stack(
     image_list = []
     label_list = []
     for path_to_image in path_list:
-        image = Image.open(path_to_image)
+        try:
+            image = Image.open(path_to_image)
 
-        if perturbation.rotate:
-            image = random_rotation(image)
-        if perturbation.crop:
-            image = random_resized_crop(image)
-        if perturbation.jpeg:
-            image = jpeg_compression(image)
-        if perturbation.noise:
-            image = noise(image)
-        if perturbation.blur:
-            image = blur(image)
+            if perturbation.rotate:
+                image = random_rotation(image)
+            if perturbation.crop:
+                image = random_resized_crop(image)
+            if perturbation.jpeg:
+                image = jpeg_compression(image)
+            if perturbation.noise:
+                image = noise(image)
+            if perturbation.blur:
+                image = blur(image)
 
-        image_list.append(np.array(image))
-        label_list.append(np.array(get_label(path_to_image, binary_classification)))
+            image_list.append(np.array(image.convert("RGB")))
+            label_list.append(np.array(get_label(path_to_image, binary_classification)))
+        except UnidentifiedImageError as e:
+            print(e, flush=True)
     return np.stack(image_list), label_list
 
 
@@ -298,7 +301,7 @@ def load_folder(
 
     # noqa: DAR401
     """
-    file_list = list(folder.glob("./*.png"))
+    file_list = list(folder.glob("./*.png")) + list(folder.glob("./*.jpg"))
     if len(file_list) < train_size + val_size + test_size:
         raise ValueError(
             "Requested set sizes must be smaller or equal to the number of images available."
@@ -322,6 +325,7 @@ def pre_process_folder(
     wavelet: str = "db1",
     boundary: str = "reflect",
     missing_label: int = None,
+    binary_classification: bool = False,
     gan_split_factor: float = 1.0,
     level: int = 3,
 ) -> None:
@@ -454,7 +458,7 @@ def pre_process_folder(
     else:
         dir_suffix = ""
 
-    binary_classification = missing_label is not None
+    binary_classification = True if missing_label is not None else binary_classification
 
     # group the sets into smaller batches to go easy on the memory.
     print("processing validation set.", flush=True)
@@ -583,6 +587,11 @@ def parse_args():
         default=None,
         help="leave this label out of the training and validation set. Used to test how the models generalize to new "
         "GANs.",
+    )
+    parser.add_argument(
+        "--binary-classification",
+        help="Only create real (0) or fake (1) labels. Every folder prefixed with 'A' will be labelled as real.",
+        action="store_true",
     )
     parser.add_argument(
         "--gan-split-factor",
