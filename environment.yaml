@@ -6,6 +6,7 @@ dependencies:
   - pytorch::pytorch-cuda
   - pytorch::pytorch
   - tensorboard
+  - h5py
   - tqdm
   - click
   - matplotlib

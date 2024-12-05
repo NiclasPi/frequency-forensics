@@ -192,14 +192,6 @@ def _parse_args():
         help="Specify wavelet for packet features."
     )
 
-    # one should not specify normalization parameters and request their calculation at the same time
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument(
-        "--calc-normalization",
-        action="store_true",
-        help="calculates mean and standard deviation used in normalization"
-             "from the training data",
-    )
     return parser.parse_args()
 
 
@@ -208,6 +200,7 @@ def create_data_loaders(
         real_datasets: List[Generator[pathlib.Path, None, None]],
         features: Literal["raw", "packets"],
         batch_size: int,
+        num_workers: int,
         device: torch.device,
         wavelet_name: str = "haar",
         wavelet_boundary: str = "boundary",
@@ -222,7 +215,7 @@ def create_data_loaders(
     transform = ComposeWithMode([
         Permute((2, 0, 1)),  # (3, H, W)
         RandomCrop((128, 128)),  # (3, 128, 128)
-        Permute((1, 2, 0)) if features == "raw" else NoTransform() # (128, 128, 3)
+        Permute((1, 2, 0)) if features == "raw" else NoTransform()  # (128, 128, 3)
     ])
 
     gpu_transform = None
@@ -232,7 +225,7 @@ def create_data_loaders(
 
         gpu_transform = Compose([
             WPT2d(wavelet_name, 3, mode=wavelet_boundary),  # (pN, B, 3, pH, pW)
-            Permute((1, 0, 3, 4, 2)), # (B, pN, pH, pW, 3)
+            Permute((1, 0, 3, 4, 2)),  # (B, pN, pH, pW, 3)
         ])
 
     for gen in fake_datasets:
@@ -283,7 +276,10 @@ def create_data_loaders(
     # compute mean/std on train set
     welford = WelfordEstimator()
     transform.set_eval_mode()  # stop randomness
-    for batch, _ in DataLoader(ConcatDataset(train_datasets), batch_size=batch_size, shuffle=False, num_workers=3):
+    for batch, _ in DataLoader(ConcatDataset(train_datasets),
+                               batch_size=batch_size,
+                               shuffle=False,
+                               num_workers=num_workers):
         batch = batch.to(device, non_blocking=True, dtype=torch.float32)
         if gpu_transform is not None:
             batch = gpu_transform(batch)
@@ -294,18 +290,18 @@ def create_data_loaders(
             break
 
     mean, std = welford.finalize()
-    mean = mean.to(dtype=torch.float32, device=device)
-    std = std.to(dtype=torch.float32, device=device)
 
     # append normalize transform
     if gpu_transform is not None:
         gpu_transform.append(
-            Normalize(mean=mean, std=std)
+            Normalize(mean=mean.to(dtype=torch.float32, device=device),
+                      std=std.to(dtype=torch.float32, device=device))
         )
     else:
         transform.extend([
             ToTensor(),  # because mean/std are tensors
-            Normalize(mean=mean, std=std)
+            Normalize(mean=mean.to(dtype=torch.float32, device=torch.devicec("cpu")),
+                      std=std.to(dtype=torch.float32, device=torch.devicec("cpu")))
         ])
 
     transform.set_train_mode()  # reset randomness
@@ -315,13 +311,13 @@ def create_data_loaders(
         train_set.data_transform = transform
 
     train_data_loader = DataLoader(
-        ConcatDataset(train_datasets), batch_size=batch_size, shuffle=True, num_workers=3,
+        ConcatDataset(train_datasets), batch_size=batch_size, shuffle=True, num_workers=num_workers
     )
     valid_data_loader = DataLoader(
-        ConcatDataset(valid_datasets), batch_size=batch_size, shuffle=False, num_workers=3
+        ConcatDataset(valid_datasets), batch_size=batch_size, shuffle=False, num_workers=num_workers
     )
     test_loader = DataLoader(
-        ConcatDataset(test_datasets), batch_size=batch_size, shuffle=False, num_workers=3
+        ConcatDataset(test_datasets), batch_size=batch_size, shuffle=False, num_workers=num_workers
     )
 
     return train_data_loader, valid_data_loader, test_loader, gpu_transform
@@ -372,6 +368,7 @@ def main():
         real_datasets,
         args.features,
         args.batch_size,
+        args.num_workers,
         device,
         wavelet_name=args.wavelet_name,
     )
