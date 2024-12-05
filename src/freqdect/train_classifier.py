@@ -5,23 +5,50 @@ import os
 import pathlib
 import pickle
 from datetime import datetime
-from typing import Any, Tuple, Literal, List, Generator
+from itertools import chain
+from typing import Any, Generator, Literal, Optional, Tuple
 
-import numpy as np
 import torch
+from pywt import Wavelet
+from ptwt.packets import WaveletPacket2D, get_freq_order
 from torch.utils.data import DataLoader, ConcatDataset
 from tqdm import tqdm
 
 from freqdect.models import CNN, Regression, compute_parameter_total, save_model
 from freqdect.prepare_dataset import WelfordEstimator
 from dltoolbox.dataset import H5Dataset
-from dltoolbox.transforms import ComposeWithMode, Normalize, Permute, RandomCrop
+from dltoolbox.transforms import *
+
+
+class WPT2d(TransformerBase):
+    def __init__(self, wavelet: str, levels: int, mode: str = "reflect", log: bool = True, eps: float = 1e-12):
+        self.wavelet = Wavelet(wavelet)
+        self.levels = levels
+        self.mode = mode
+        self.log = log
+        self.eps = eps
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        wp_tree = WaveletPacket2D(x, self.wavelet, self.mode, maxlevel=self.levels)
+        wp_nodes = list(''.join(str(i) for i in x) for x in chain.from_iterable(get_freq_order(self.levels)))
+        wp_list = []
+
+        for node in wp_nodes:
+            wp_list.append(wp_tree[node])
+
+        wp_result = torch.stack(wp_list).squeeze()
+
+        if self.log:
+            wp_result = torch.log(torch.abs(wp_result) + self.eps)
+
+        return wp_result
 
 
 def val_test_loop(
         data_loader,
         model: torch.nn.Module,
         loss_fun,
+        gpu_transform: Optional[Transformer] = None,
         make_binary_labels: bool = False,
         device: torch.device = torch.device("cpu"),
         _description: str = "Validation",
@@ -47,6 +74,9 @@ def val_test_loop(
         for data, labels in iter(data_loader):
             data: torch.Tensor = data.to(device, non_blocking=True, dtype=torch.float32)
             labels: torch.Tensor = labels.to(device, non_blocking=True, dtype=torch.long)
+
+            if gpu_transform is not None:
+                data = gpu_transform(data)
 
             if make_binary_labels:
                 labels[labels > 0] = 1
@@ -131,12 +161,6 @@ def _parse_args():
     )
 
     parser.add_argument(
-        "--tensorboard",
-        action="store_true",
-        help="enables a tensorboard visualization.",
-    )
-
-    parser.add_argument(
         "--pbar",
         action="store_true",
         help="enables progress bars",
@@ -161,6 +185,13 @@ def _parse_args():
              "in the loss calculation. Expects one weight per class.",
     )
 
+    parser.add_argument(
+        "--wavelet-name",
+        type=str,
+        default="haar",
+        help="Specify wavelet for packet features."
+    )
+
     # one should not specify normalization parameters and request their calculation at the same time
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
@@ -175,10 +206,13 @@ def _parse_args():
 def create_data_loaders(
         fake_datasets: List[Generator[pathlib.Path, None, None]],
         real_datasets: List[Generator[pathlib.Path, None, None]],
+        features: Literal["raw", "packets"],
         batch_size: int,
         device: torch.device,
+        wavelet_name: str = "haar",
+        wavelet_boundary: str = "boundary",
         mode: Literal["disk", "memory"] = "disk"
-) -> Tuple[DataLoader, DataLoader, DataLoader]:
+) -> Tuple[DataLoader, DataLoader, DataLoader, Optional[Transformer]]:
     """Create the data loaders needed for training."""
 
     train_datasets = []
@@ -187,9 +221,19 @@ def create_data_loaders(
 
     transform = ComposeWithMode([
         Permute((2, 0, 1)),  # (3, H, W)
-        RandomCrop((128, 128)), # (3, 128, 128)
-        Permute((1, 2, 0)), # (128, 128, 3)
+        RandomCrop((128, 128)),  # (3, 128, 128)
+        Permute((1, 2, 0)) if features == "raw" else NoTransform() # (128, 128, 3)
     ])
+
+    gpu_transform = None
+
+    if features == "packets":
+        print(f"Wavelet packet transform with wavelet={wavelet_name}, levels=3, and boundary={wavelet_boundary}")
+
+        gpu_transform = Compose([
+            WPT2d(wavelet_name, 3, mode=wavelet_boundary),  # (pN, B, 3, pH, pW)
+            Permute((1, 0, 3, 4, 2)), # (B, pN, pH, pW, 3)
+        ])
 
     for gen in fake_datasets:
         for path in gen:
@@ -241,14 +285,29 @@ def create_data_loaders(
     transform.set_eval_mode()  # stop randomness
     for batch, _ in DataLoader(ConcatDataset(train_datasets), batch_size=batch_size, shuffle=False, num_workers=3):
         batch = batch.to(device, non_blocking=True, dtype=torch.float32)
+        if gpu_transform is not None:
+            batch = gpu_transform(batch)
+
         welford.update(batch)
         if __debug__:
             print("[DEBUG] break out of mean/std computation")
             break
+
     mean, std = welford.finalize()
+    mean = mean.to(dtype=torch.float32, device=device)
+    std = std.to(dtype=torch.float32, device=device)
 
     # append normalize transform
-    transform.append(Normalize(mean=mean, std=std))
+    if gpu_transform is not None:
+        gpu_transform.append(
+            Normalize(mean=mean, std=std)
+        )
+    else:
+        transform.extend([
+            ToTensor(),  # because mean/std are tensors
+            Normalize(mean=mean, std=std)
+        ])
+
     transform.set_train_mode()  # reset randomness
 
     # set transform in train sets
@@ -265,7 +324,7 @@ def create_data_loaders(
         ConcatDataset(test_datasets), batch_size=batch_size, shuffle=False, num_workers=3
     )
 
-    return train_data_loader, valid_data_loader, test_loader
+    return train_data_loader, valid_data_loader, test_loader, gpu_transform
 
 
 def main():
@@ -308,11 +367,13 @@ def main():
     real_datasets: List[Generator[pathlib.Path, None, None]] = [root_path.glob(f"{prefix}*.hdf5")
                                                                 for prefix in args.dataset_negative_prefix]
 
-    train_data_loader, valid_data_loader, test_data_loader = create_data_loaders(
+    train_data_loader, valid_data_loader, test_data_loader, gpu_transform = create_data_loaders(
         fake_datasets,
         real_datasets,
+        args.features,
         args.batch_size,
         device,
+        wavelet_name=args.wavelet_name,
     )
 
     validation_list = []
@@ -353,6 +414,9 @@ def main():
             data: torch.Tensor = batch[0].to(device, non_blocking=True, dtype=torch.float32)
             labels: torch.Tensor = batch[1].to(device, non_blocking=True, dtype=torch.long)
 
+            if gpu_transform is not None:
+                data = gpu_transform(data)
+
             if make_binary_labels:
                 labels[labels > 0] = 1
             labels.squeeze_()
@@ -387,6 +451,7 @@ def main():
                     valid_data_loader,
                     model,
                     loss_fun,
+                    gpu_transform=gpu_transform,
                     device=device,
                     make_binary_labels=make_binary_labels,
                 )
@@ -408,6 +473,8 @@ def main():
             + f"{args.epochs}e"
             + "_"
             + str(args.model)
+            + "_"
+            + str(args.features)
     )
     save_model(model, model_file + "_" + str(args.seed) + ".pt")
     print(model_file, " saved.")
@@ -420,6 +487,7 @@ def main():
             test_data_loader,
             model,
             loss_fun,
+            gpu_transform=gpu_transform,
             device=device,
             make_binary_labels=make_binary_labels,
             _description="Testing",

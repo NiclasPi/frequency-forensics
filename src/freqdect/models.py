@@ -43,6 +43,7 @@ class CNN(torch.nn.Module):
                 torch.nn.ReLU(),
                 torch.nn.Conv2d(24, 24, 9),
                 torch.nn.ReLU(),
+                torch.nn.AdaptiveAvgPool2d((1, 1))  # always reduce to (24, 1, 1)
             )
             self.linear = torch.nn.Linear(24, classes)
         elif feature == "all-packets" or feature == "all-packets-fourier":

@@ -17,7 +17,7 @@ dependencies:
   - fastai::opencv-python-headless~=4.5
   - pip
   - pip:
-    - ptwt==0.1.2
+    - ptwt==0.1.6
 #    - more_itertools
     - more_click
   - __cuda=12.1
