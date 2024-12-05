@@ -300,8 +300,8 @@ def create_data_loaders(
     else:
         transform.extend([
             ToTensor(),  # because mean/std are tensors
-            Normalize(mean=mean.to(dtype=torch.float32, device=torch.devicec("cpu")),
-                      std=std.to(dtype=torch.float32, device=torch.devicec("cpu")))
+            Normalize(mean=mean.to(dtype=torch.float32, device=torch.device("cpu")),
+                      std=std.to(dtype=torch.float32, device=torch.device("cpu")))
         ])
 
     transform.set_train_mode()  # reset randomness
