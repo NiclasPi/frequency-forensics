@@ -2,26 +2,28 @@
 
 import argparse
 import os
+import pathlib
 import pickle
-from typing import Any, Tuple
+from datetime import datetime
+from typing import Any, Tuple, Literal, List, Generator
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
-from torch.utils.tensorboard.writer import SummaryWriter
+from torch.utils.data import DataLoader, ConcatDataset
 from tqdm import tqdm
 
-from .data_loader import CombinedDataset, NumpyDataset
-from .models import CNN, Regression, compute_parameter_total, save_model
+from models import CNN, Regression, compute_parameter_total, save_model
+from dltoolbox.dataset import H5Dataset
+from dltoolbox.transforms import ComposeWithMode, Permute, RandomCrop, ToTensor
 
 
 def val_test_loop(
-    data_loader,
-    model: torch.nn.Module,
-    loss_fun,
-    make_binary_labels: bool = False,
-    _description: str = "Validation",
-    pbar: bool = False,
+        data_loader,
+        model: torch.nn.Module,
+        loss_fun,
+        make_binary_labels: bool = False,
+        device: torch.device = torch.device("cpu"),
+        _description: str = "Validation",
 ) -> Tuple[float, Any]:
     """Test the performance of a model on a data set by calculating the prediction accuracy and loss of the model.
 
@@ -39,26 +41,21 @@ def val_test_loop(
     with torch.no_grad():
         model.eval()
         val_total = 0
-
         val_ok = 0.0
-        for val_batch in iter(data_loader):
-            if type(data_loader.dataset) is CombinedDataset:
-                batch_images = {
-                    key: val_batch[key].cuda(non_blocking=True)
-                    for key in data_loader.dataset.key
-                }
-            else:
-                batch_images = val_batch[data_loader.dataset.key].cuda(
-                    non_blocking=True
-                )
-            batch_labels = val_batch["label"].cuda(non_blocking=True)
-            out = model(batch_images)
+
+        for data, labels in iter(data_loader):
+            data: torch.Tensor = data.to(device, non_blocking=True, dtype=torch.float32)
+            labels: torch.Tensor = labels.to(device, non_blocking=True, dtype=torch.long)
+
             if make_binary_labels:
-                batch_labels[batch_labels > 0] = 1
-            val_loss = loss_fun(torch.squeeze(out), batch_labels)
-            ok_mask = torch.eq(torch.max(out, dim=-1)[1], batch_labels)
+                labels[labels > 0] = 1
+            labels.squeeze_()
+
+            out = model(data)
+            val_loss = loss_fun(torch.squeeze(out), labels)
+            ok_mask = torch.eq(torch.max(out, dim=-1)[1], labels)
             val_ok += torch.sum(ok_mask).item()
-            val_total += batch_labels.shape[0]
+            val_total += labels.shape[0]
         val_acc = val_ok / val_total
         print("acc", val_acc, "ok", val_ok, "total", val_total)
     return val_acc, val_loss
@@ -92,7 +89,7 @@ def _parse_args():
         help="weight decay for optimizer (default: 0)",
     )
     parser.add_argument(
-        "--epochs", type=int, default=20, help="number of epochs (default: 10)"
+        "--epochs", type=int, default=20, help="number of epochs (default: 20)"
     )
     parser.add_argument(
         "--validation-interval",
@@ -101,11 +98,22 @@ def _parse_args():
         help="number of training steps after which the model is tested on the validation data set (default: 200)",
     )
     parser.add_argument(
-        "--data-prefix",
+        "--dataset-root-dir",
+        type=str,
+        required=True,
+        help="path to directory containing the dataset files"
+    )
+    parser.add_argument(
+        "--dataset-positive-prefix",
         type=str,
         nargs="+",
-        default=["./data/source_data_packets"],
-        help="shared prefix of the data paths (default: ./data/source_data_packets)",
+        help="name prefix of a positive (fake) dataset"
+    )
+    parser.add_argument(
+        "--dataset-negative-prefix",
+        type=str,
+        nargs="+",
+        help="name prefix to negative (real) dataset"
     )
     parser.add_argument(
         "--nclasses", type=int, default=2, help="number of classes (default: 2)"
@@ -138,8 +146,8 @@ def _parse_args():
         type=int,
         default=2,
         help="Number of worker processes started by the test and validation data loaders. The training data_loader "
-        "uses three times this argument many workers. Hence, this argument should probably be chosen below 10. "
-        "Defaults to 2.",
+             "uses three times this argument many workers. Hence, this argument should probably be chosen below 10. "
+             "Defaults to 2.",
     )
 
     parser.add_argument(
@@ -149,7 +157,7 @@ def _parse_args():
         nargs="+",
         default=None,
         help="If specified, training samples are weighted based on their class "
-        "in the loss calculation. Expects one weight per class.",
+             "in the loss calculation. Expects one weight per class.",
     )
 
     # one should not specify normalization parameters and request their calculation at the same time
@@ -158,82 +166,94 @@ def _parse_args():
         "--calc-normalization",
         action="store_true",
         help="calculates mean and standard deviation used in normalization"
-        "from the training data",
+             "from the training data",
     )
     return parser.parse_args()
 
 
-def create_data_loaders(data_prefix: str, batch_size: int) -> tuple:
-    """Create the data loaders needed for training.
+def create_data_loaders(
+        fake_datasets: List[Generator[pathlib.Path, None, None]],
+        real_datasets: List[Generator[pathlib.Path, None, None]],
+        batch_size: int,
+        device: torch.device,
+        mode: Literal["disk", "memory"] = "disk"
+) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    """Create the data loaders needed for training."""
 
-    The test set is created outside a loader.
+    train_datasets = []
+    valid_datasets = []
+    test_datasets = []
 
-    Args:
-        data_prefix (str): Where to look for the data.
+    transform = ComposeWithMode([
+        ToTensor(device),  # (H, W, 3)
+        Permute((2, 0, 1)),  # (3, H, W)
+        RandomCrop((128, 128)), # (3, 128, 128)
+        Permute((1, 2, 0)), # (128, 128, 3)
+    ])
 
-    Raises:
-        RuntimeError: Raised if the prefix is incorrect.
+    for gen in fake_datasets:
+        for path in gen:
+            if 'train' in path.name:
+                train_datasets.append(
+                    H5Dataset(mode, path.as_posix(),
+                              static_label=torch.tensor([1]))
+                )
+            elif 'valid' in path.name:
+                valid_datasets.append(
+                    H5Dataset(mode, path.as_posix(),
+                              static_label=torch.tensor([1]),
+                              data_transform=transform)
+                )
+            elif 'test' in path.name:
+                test_datasets.append(
+                    H5Dataset(mode, path.as_posix(),
+                              static_label=torch.tensor([1]),
+                              data_transform=transform)
+                )
+            else:
+                raise RuntimeError("could not infer train/valid/test from file name")
+    for gen in real_datasets:
+        for path in gen:
+            if 'train' in path.name:
+                train_datasets.append(
+                    H5Dataset(mode, path.as_posix(),
+                              static_label=torch.tensor([0]))
+                )
+            elif 'valid' in path.name:
+                valid_datasets.append(
+                    H5Dataset(mode, path.as_posix(),
+                              static_label=torch.tensor([0]),
+                              data_transform=transform)
+                )
+            elif 'test' in path.name:
+                test_datasets.append(
+                    H5Dataset(mode, path.as_posix(),
+                              static_label=torch.tensor([0]),
+                              data_transform=transform)
+                )
+            else:
+                raise RuntimeError("could not infer train/valid/test from file name")
 
-    Returns:
-        list: train_data_loader, val_data_loader, test_data_set
 
-    # noqa: DAR401
-    """
-    data_set_list = []
-    for data_prefix_el in data_prefix:
-        with open(f"{data_prefix_el}_train/mean_std.pkl", "rb") as file:
-            mean, std = pickle.load(file)
-            mean = torch.from_numpy(mean.astype(np.float32))
-            std = torch.from_numpy(std.astype(np.float32))
+    # compute mean/std on train set
+    # TODO
 
-        print("mean", mean, "std", std)
-        key = "image"
-        if "raw" in data_prefix_el.split("_"):
-            key = "raw"
-        elif "packets" in data_prefix_el.split("_"):
-            key = "packets" + data_prefix_el.split("_")[-1]
-        elif "fourier" in data_prefix_el.split("_"):
-            key = "fourier"
 
-        train_data_set = NumpyDataset(
-            data_prefix_el + "_train", mean=mean, std=std, key=key
-        )
-        val_data_set = NumpyDataset(
-            data_prefix_el + "_val", mean=mean, std=std, key=key
-        )
-        test_data_set = NumpyDataset(
-            data_prefix_el + "_test", mean=mean, std=std, key=key
-        )
-        data_set_list.append((train_data_set, val_data_set, test_data_set))
+    # set transform in train sets
+    for train_set in train_datasets:
+        train_set.data_transform = transform
 
-    if len(data_set_list) == 1:
-        train_data_loader = DataLoader(
-            train_data_set, batch_size=batch_size, shuffle=True, num_workers=3
-        )
-        val_data_loader = DataLoader(
-            val_data_set, batch_size=batch_size, shuffle=False, num_workers=3
-        )
-        test_data_sets: Any = test_data_set
-    elif len(data_set_list) > 1:
-        train_data_sets = [el[0] for el in data_set_list]
-        val_data_sets = [el[1] for el in data_set_list]
-        test_data_sets = [el[2] for el in data_set_list]
-        train_data_loader = DataLoader(
-            CombinedDataset(train_data_sets),
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=3,
-        )
-        val_data_loader = DataLoader(
-            CombinedDataset(val_data_sets),
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=3,
-        )
-    else:
-        raise RuntimeError("Failed to load data from the specified prefixes.")
+    train_data_loader = DataLoader(
+        ConcatDataset(train_datasets), batch_size=batch_size, shuffle=True, num_workers=3,
+    )
+    valid_data_loader = DataLoader(
+        ConcatDataset(valid_datasets), batch_size=batch_size, shuffle=False, num_workers=3
+    )
+    test_loader = DataLoader(
+        ConcatDataset(test_datasets), batch_size=batch_size, shuffle=False, num_workers=3
+    )
 
-    return train_data_loader, val_data_loader, test_data_sets
+    return train_data_loader, valid_data_loader, test_loader
 
 
 def main():
@@ -262,10 +282,25 @@ def main():
 
     # fix the seed in the interest of reproducible results.
     torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"device: {device}")
 
     make_binary_labels = args.nclasses == 2
-    train_data_loader, val_data_loader, test_data_set = create_data_loaders(
-        args.data_prefix, args.batch_size
+
+    root_path = pathlib.Path(args.dataset_root_dir)
+
+    fake_datasets: List[Generator[pathlib.Path, None, None]] = [root_path.glob(f"{prefix}*.hdf5")
+                                                                for prefix in args.dataset_positive_prefix]
+    real_datasets: List[Generator[pathlib.Path, None, None]] = [root_path.glob(f"{prefix}*.hdf5")
+                                                                for prefix in args.dataset_negative_prefix]
+
+    train_data_loader, valid_data_loader, test_data_loader = create_data_loaders(
+        fake_datasets,
+        real_datasets,
+        args.batch_size,
+        device,
     )
 
     validation_list = []
@@ -274,63 +309,46 @@ def main():
     step_total = 0
 
     if args.model == "cnn":
-        model = CNN(args.nclasses, args.features).cuda()
+        model = CNN(args.nclasses, args.features).to(device)
     else:
-        model = Regression(args.nclasses).cuda()
+        model = Regression(args.nclasses).to(device)
 
     print("model parameter count:", compute_parameter_total(model))
 
-    if args.tensorboard:
-        writer_str = "runs/"
-        writer_str += "params_test2/"
-        writer_str += f"{args.model}/"
-        writer_str += f"{args.batch_size}/"
-        writer_str += str(args.data_prefix.split("/")[-1]) + "/"
-        writer_str += f"{args.learning_rate}_"
-        writer_str += f"{args.seed}"
-        writer = SummaryWriter(writer_str, max_queue=100)
+    loss_fun = torch.nn.NLLLoss(
+        weight=torch.tensor(args.class_weights).to(device) if args.class_weights else None
+    ).to(device)
 
-    if args.class_weights:
-        loss_fun = torch.nn.NLLLoss(weight=torch.tensor(args.class_weights).cuda())
-    else:
-        loss_fun = torch.nn.NLLLoss()
     optimizer = torch.optim.Adam(
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
     )
 
     for e in tqdm(
-        range(args.epochs), desc="Epochs", unit="epochs", disable=not args.pbar
+            range(args.epochs), desc="Epochs", unit="epochs", disable=not args.pbar
     ):
         # iterate over training data.
         for it, batch in enumerate(
-            tqdm(
-                iter(train_data_loader),
-                desc="Training",
-                unit="batches",
-                disable=not args.pbar,
-            )
+                tqdm(
+                    iter(train_data_loader),
+                    desc="Training",
+                    unit="batches",
+                    disable=not args.pbar,
+                )
         ):
             model.train()
             optimizer.zero_grad()
-            # find the bug.
-            if type(train_data_loader.dataset) is CombinedDataset:
-                batch_images = {
-                    key: batch[key].cuda(non_blocking=True)
-                    for key in train_data_loader.dataset.key
-                }
-            else:
-                batch_images = batch[train_data_loader.dataset.key].cuda(
-                    non_blocking=True
-                )
 
-            batch_labels = batch["label"].cuda(non_blocking=True)
+            data: torch.Tensor = batch[0].to(device, non_blocking=True, dtype=torch.float32)
+            labels: torch.Tensor = batch[1].to(device, non_blocking=True, dtype=torch.long)
+
             if make_binary_labels:
-                batch_labels[batch_labels > 0] = 1
+                labels[labels > 0] = 1
+            labels.squeeze_()
 
-            out = model(batch_images)
-            loss = loss_fun(torch.squeeze(out), batch_labels)
-            ok_mask = torch.eq(torch.max(out, dim=-1)[1], batch_labels)
-            acc = torch.sum(ok_mask.type(torch.float32)) / len(batch_labels)
+            out = model(data)
+            loss = loss_fun(torch.squeeze(out), labels)
+            ok_mask = torch.eq(torch.max(out, dim=-1)[1], labels)
+            acc = torch.sum(ok_mask.type(torch.float32)) / len(labels)
 
             if it % 10 == 0:
                 print(
@@ -351,75 +369,50 @@ def main():
             loss_list.append([step_total, e, loss.item()])
             accuracy_list.append([step_total, e, acc.item()])
 
-            if args.tensorboard:
-                writer.add_scalar("loss/train", loss.item(), step_total)
-                writer.add_scalar("accuracy/train", acc.item(), step_total)
-                if step_total == 0:
-                    writer.add_graph(model, batch_images)
-
             # iterate over val batches.
             if step_total % args.validation_interval == 0:
                 val_acc, val_loss = val_test_loop(
-                    val_data_loader,
+                    valid_data_loader,
                     model,
                     loss_fun,
+                    device=device,
                     make_binary_labels=make_binary_labels,
-                    pbar=args.pbar,
                 )
                 validation_list.append([step_total, e, val_acc])
                 if validation_list[-1] == 1.0:
                     print("val acc ideal stopping training.")
                     break
 
-                if args.tensorboard:
-                    writer.add_scalar("loss/validation", val_loss, step_total)
-                    writer.add_scalar("accuracy/validation", val_acc, step_total)
-
-        if args.tensorboard:
-            writer.add_scalar("epochs", e, step_total)
-
     print(validation_list)
 
     if not os.path.exists("./log/"):
         os.makedirs("./log/")
     model_file = (
-        "./log/"
-        + args.data_prefix[0].split("/")[-1]
-        + "_"
-        + str(args.learning_rate)
-        + "_"
-        + f"{args.epochs}e"
-        + "_"
-        + str(args.model)
+            "./log/"
+            + datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+            + "_"
+            + str(args.learning_rate)
+            + "_"
+            + f"{args.epochs}e"
+            + "_"
+            + str(args.model)
     )
     save_model(model, model_file + "_" + str(args.seed) + ".pt")
     print(model_file, " saved.")
 
     # Run over the test set.
-    print("Training done testing....")
-    if type(test_data_set) is list:
-        test_data_set = CombinedDataset(test_data_set)
+    print("Training done, start testing....")
 
-    test_data_loader = DataLoader(
-        test_data_set,
-        args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-    )
     with torch.no_grad():
         test_acc, test_loss = val_test_loop(
             test_data_loader,
             model,
             loss_fun,
+            device=device,
             make_binary_labels=make_binary_labels,
-            pbar=not args.pbar,
             _description="Testing",
         )
         print("test acc", test_acc)
-
-    if args.tensorboard:
-        writer.add_scalar("accuracy/test", test_acc, step_total)
-        writer.add_scalar("loss/test", test_loss, step_total)
 
     _save_stats(
         model_file,
@@ -431,18 +424,15 @@ def main():
         len(iter(train_data_loader)),
     )
 
-    if args.tensorboard:
-        writer.close()
-
 
 def _save_stats(
-    model_file: str,
-    loss_list: list,
-    accuracy_list: list,
-    validation_list: list,
-    test_acc: float,
-    args,
-    iterations_per_epoch: int,
+        model_file: str,
+        loss_list: list,
+        accuracy_list: list,
+        validation_list: list,
+        test_acc: float,
+        args,
+        iterations_per_epoch: int,
 ):
     stats_file = model_file + "_" + str(args.seed) + ".pkl"
     try:

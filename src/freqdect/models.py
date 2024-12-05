@@ -16,7 +16,7 @@ def compute_parameter_total(net: torch.nn.Module) -> int:
     total = 0
     for p in net.parameters():
         if p.requires_grad:
-            print(p.shape)
+            #print(p.shape)
             total += np.prod(p.shape)  # type: ignore
     return total
 
