@@ -14,6 +14,10 @@ conda activate Forensics
 
 export PYTHONPATH=$PYTHONPATH:$(pwd):$(pwd)/src
 
-python -m freqdect.train_classifier --data-prefix data/source_raw_crop --features raw --model cnn
+python -m freqdect.train_classifier \
+  --dataset-root-dir /home/npillath/datasets/image \
+  --dataset-positive afhqv2_11k_512 ffhq_11k_512 \
+  --dataset-negative afhqv2_stylegan3_11k_512 ffhq_stylegan3_11k_512 \
+  --model cnn --features raw
 
 echo "SBATCH completed"
