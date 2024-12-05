@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from abc import ABC, abstractmethod
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, Iterable, List, Optional, Tuple, Union
 
 Transformer = Callable[[Union[np.ndarray, torch.Tensor]], Union[np.ndarray, torch.Tensor]]
 
@@ -45,6 +45,18 @@ class Compose(TransformerBase):
     def __len__(self) -> int:
         return len(self._transforms)
 
+    def __getitem__(self, index: int) -> Transformer:
+        return self._transforms[index]
+
+    def append(self, transform: Transformer):
+        self._transforms.append(transform)
+
+    def extend(self, transforms: Iterable[Transformer]):
+        self._transforms.extend(transforms)
+
+    def insert(self, index: int, transform: Transformer):
+        self._transforms.insert(index, transform)
+
 
 class ComposeWithMode(Compose):
     def set_train_mode(self) -> None:
@@ -79,9 +91,9 @@ class ToTensor(TransformerBase):
 
 
 class Normalize(TransformerBase):
-    """Normalize using the mean and standard deviation."""
+    """Normalize using the mean and standard deviation. Supports broadcasting to a common shape."""
 
-    def __init__(self, mean: float, std: float):
+    def __init__(self, mean: Union[float, np.ndarray, torch.Tensor], std: Union[float, np.ndarray, torch.Tensor]):
         self._mean = mean
         self._std = std
 

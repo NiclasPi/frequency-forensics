@@ -12,9 +12,10 @@ import torch
 from torch.utils.data import DataLoader, ConcatDataset
 from tqdm import tqdm
 
-from models import CNN, Regression, compute_parameter_total, save_model
+from freqdect.models import CNN, Regression, compute_parameter_total, save_model
+from freqdect.prepare_dataset import WelfordEstimator
 from dltoolbox.dataset import H5Dataset
-from dltoolbox.transforms import ComposeWithMode, Permute, RandomCrop, ToTensor
+from dltoolbox.transforms import ComposeWithMode, Normalize, Permute, RandomCrop
 
 
 def val_test_loop(
@@ -185,7 +186,6 @@ def create_data_loaders(
     test_datasets = []
 
     transform = ComposeWithMode([
-        ToTensor(device),  # (H, W, 3)
         Permute((2, 0, 1)),  # (3, H, W)
         RandomCrop((128, 128)), # (3, 128, 128)
         Permute((1, 2, 0)), # (128, 128, 3)
@@ -196,7 +196,8 @@ def create_data_loaders(
             if 'train' in path.name:
                 train_datasets.append(
                     H5Dataset(mode, path.as_posix(),
-                              static_label=torch.tensor([1]))
+                              static_label=torch.tensor([1]),
+                              data_transform=transform)
                 )
             elif 'valid' in path.name:
                 valid_datasets.append(
@@ -217,7 +218,8 @@ def create_data_loaders(
             if 'train' in path.name:
                 train_datasets.append(
                     H5Dataset(mode, path.as_posix(),
-                              static_label=torch.tensor([0]))
+                              static_label=torch.tensor([0]),
+                              data_transform=transform)
                 )
             elif 'valid' in path.name:
                 valid_datasets.append(
@@ -234,10 +236,20 @@ def create_data_loaders(
             else:
                 raise RuntimeError("could not infer train/valid/test from file name")
 
-
     # compute mean/std on train set
-    # TODO
+    welford = WelfordEstimator()
+    transform.set_eval_mode()  # stop randomness
+    for batch, _ in DataLoader(ConcatDataset(train_datasets), batch_size=batch_size, shuffle=False, num_workers=3):
+        batch = batch.to(device, non_blocking=True, dtype=torch.float32)
+        welford.update(batch)
+        if __debug__:
+            print("[DEBUG] break out of mean/std computation")
+            break
+    mean, std = welford.finalize()
 
+    # append normalize transform
+    transform.append(Normalize(mean=mean, std=std))
+    transform.set_train_mode()  # reset randomness
 
     # set transform in train sets
     for train_set in train_datasets:
