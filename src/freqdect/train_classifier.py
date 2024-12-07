@@ -44,6 +44,23 @@ class WPT2d(TransformerBase):
         return wp_result
 
 
+class FFT(TransformerBase):
+    def __init__(self, dims: Tuple[int, ...], log: bool = True, eps: float = 1e-12):
+        self.dims = dims
+        self.log = log
+        self.eps = eps
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        fft = torch.fft.fftn(x, dim=self.dims)
+
+        if self.log:
+            fft = torch.log(torch.abs(fft) + self.eps)
+        else:
+            fft = torch.cat([torch.real(fft), torch.imag(fft)], dim=-1)
+
+        return fft
+
+
 def val_test_loop(
         data_loader,
         model: torch.nn.Module,
@@ -215,16 +232,21 @@ def create_data_loaders(
     transform = ComposeWithMode([
         Permute((2, 0, 1)),  # (3, H, W)
         RandomCrop((128, 128)),  # (3, 128, 128)
-        Permute((1, 2, 0)) if features == "raw" else NoTransform()  # (128, 128, 3)
+        Permute((1, 2, 0)) if features in ["raw", "fourier"] else NoTransform()  # (128, 128, 3)
     ])
 
     gpu_transform = None
 
-    if features == "packets":
+    if features == "fourier":
+        print("Log-scaled fast fourier transform (FFT) coefficients")
+        gpu_transform = Compose([
+            FFT((-3, -2), log=True),
+        ])
+    elif features == "packets":
         print(f"Wavelet packet transform with wavelet={wavelet_name}, levels=3, and boundary={wavelet_boundary}")
 
         gpu_transform = Compose([
-            WPT2d(wavelet_name, 3, mode=wavelet_boundary),  # (pN, B, 3, pH, pW)
+            WPT2d(wavelet_name, 3, mode=wavelet_boundary),  # (pN=4³=64, B, 3, pH, pW)
             Permute((1, 0, 3, 4, 2)),  # (B, pN, pH, pW, 3)
         ])
 
@@ -290,6 +312,7 @@ def create_data_loaders(
             break
 
     mean, std = welford.finalize()
+    print(f"Computed mean/std on train set:\nmean={mean}\nstd={std}")
 
     # append normalize transform
     if gpu_transform is not None:

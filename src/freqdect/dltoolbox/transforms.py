@@ -1,9 +1,12 @@
 import numpy as np
 import torch
 from abc import ABC, abstractmethod
-from typing import Callable, Iterable, List, Optional, Tuple, Union
+from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
-Transformer = Callable[[Union[np.ndarray, torch.Tensor]], Union[np.ndarray, torch.Tensor]]
+Transformer = Callable[
+    [Union[np.ndarray, torch.Tensor, Dict[str, Union[np.ndarray, torch.Tensor]]]],
+    Union[np.ndarray, torch.Tensor, Dict[str, Union[np.ndarray, torch.Tensor]]]
+]
 
 
 class TransformerBase(ABC):
@@ -90,15 +93,26 @@ class ToTensor(TransformerBase):
             return x.to(dtype=torch.float32, device=self._device)
 
 
-class Normalize(TransformerBase):
-    """Normalize using the mean and standard deviation. Supports broadcasting to a common shape."""
+class DictTransformCreate:
+    """Create named outputs from multiple transforms."""
 
-    def __init__(self, mean: Union[float, np.ndarray, torch.Tensor], std: Union[float, np.ndarray, torch.Tensor]):
-        self._mean = mean
-        self._std = std
+    def __init__(self, transforms: Dict[str, Transformer]):
+        self._transforms = transforms
 
-    def __call__(self, x: Union[np.ndarray, torch.Tensor]) -> Union[np.ndarray, torch.Tensor]:
-        return (x - self._mean) / self._std
+    def __call__(self, x: Union[np.ndarray, torch.Tensor]) -> Dict[str, Union[np.ndarray, torch.Tensor]]:
+        return {key: tf(x) for key, tf in self._transforms.items()}
+
+
+class DictTransformApply:
+    """Apply transform on one named input."""
+
+    def __init__(self, key: str, transform: Transformer):
+        self._key = key
+        self._transform = transform
+
+    def __call__(self, x: Dict[str, Union[np.ndarray, torch.Tensor]]) -> Dict[str, Union[np.ndarray, torch.Tensor]]:
+        x[self._key] = self._transform(x[self._key])
+        return x
 
 
 class Permute(TransformerBase):
@@ -114,6 +128,17 @@ class Permute(TransformerBase):
             return torch.permute(x, self.dims)
         else:
             raise ValueError(f"expected torch.Tensor or np.ndarray, got {type(x)}")
+
+
+class Normalize(TransformerBase):
+    """Normalize using the mean and standard deviation. Supports broadcasting to a common shape."""
+
+    def __init__(self, mean: Union[float, np.ndarray, torch.Tensor], std: Union[float, np.ndarray, torch.Tensor]):
+        self._mean = mean
+        self._std = std
+
+    def __call__(self, x: Union[np.ndarray, torch.Tensor]) -> Union[np.ndarray, torch.Tensor]:
+        return (x - self._mean) / self._std
 
 
 class RandomCrop(TransformerWithMode):

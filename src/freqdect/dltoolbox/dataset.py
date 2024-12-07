@@ -236,11 +236,12 @@ class H5Dataset(Dataset):
         return self._instance.__getitem__(index)
 
     def __getattr__(self, name: str) -> Any:
-        # delegate method or attribute access to the instance
+        # delegate attribute access to the instance
         return getattr(self._instance, name)
 
     def __setattr__(self, key: str, value: Any) -> None:
         if key != "_instance":
+            # delegate to the instance
             setattr(self._instance, key, value)
         else:
             self.__dict__[key] = value
