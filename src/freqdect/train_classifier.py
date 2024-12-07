@@ -6,7 +6,7 @@ import pathlib
 import pickle
 from datetime import datetime
 from itertools import chain
-from typing import Any, Generator, Literal, Optional, Tuple
+from typing import Any, Dict, Generator, Literal, Optional, Tuple
 
 import torch
 from pywt import Wavelet
@@ -40,6 +40,33 @@ class WPT2d(TransformerBase):
 
         if self.log:
             wp_result = torch.log(torch.abs(wp_result) + self.eps)
+
+        return wp_result
+
+
+class WPT2dAll:
+    def __init__(self, wavelet: str, levels: int, mode: str = "reflect", log: bool = True, eps: float = 1e-12):
+        self.wavelet = Wavelet(wavelet)
+        self.levels = levels
+        self.mode = mode
+        self.log = log
+        self.eps = eps
+
+    def __call__(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        wp_tree = WaveletPacket2D(x, self.wavelet, self.mode, maxlevel=self.levels)
+
+        wp_result = {"raw": x}
+
+        for level in range(1, self.levels + 1):
+            wp_nodes = list(''.join(str(i) for i in x) for x in chain.from_iterable(get_freq_order(level)))
+            wp_list = []
+
+            for node in wp_nodes:
+                wp_list.append(wp_tree[node])
+
+            wp_result[f"packets{level}"] = torch.stack(wp_list).squeeze()
+            if self.log:
+                wp_result[f"packets{level}"] = torch.log(torch.abs(wp_result[f"packets{level}"]) + self.eps)
 
         return wp_result
 
@@ -237,17 +264,37 @@ def create_data_loaders(
 
     gpu_transform = None
 
-    if features == "fourier":
-        print("Log-scaled fast fourier transform (FFT) coefficients")
-        gpu_transform = Compose([
-            FFT((-3, -2), log=True),
-        ])
-    elif features == "packets":
-        print(f"Wavelet packet transform with wavelet={wavelet_name}, levels=3, and boundary={wavelet_boundary}")
-
+    if features == "packets":
+        print(f"Level-3 wavelet packets wavelet={wavelet_name} and boundary={wavelet_boundary}")
         gpu_transform = Compose([
             WPT2d(wavelet_name, 3, mode=wavelet_boundary),  # (pN=4³=64, B, 3, pH, pW)
             Permute((1, 0, 3, 4, 2)),  # (B, pN, pH, pW, 3)
+        ])
+    elif features == "all-packets":
+        print(f"All wavelet packets of level-3 WPT with wavelet={wavelet_name} and boundary={wavelet_boundary}")
+        gpu_transform = Compose([
+            WPT2dAll(wavelet_name, 3, mode=wavelet_boundary),  # Dict[str, {raw, (pN, B, 3, pH, pW)}]
+            DictTransformApply("raw", Permute((0, 2, 3, 1))),  # (B, 128, 128, 3)
+            DictTransformApply("packets1", Permute((1, 0, 3, 4, 2))),  # (B, pN, pH, pW, 3)
+            DictTransformApply("packets2", Permute((1, 0, 3, 4, 2))),
+            DictTransformApply("packets3", Permute((1, 0, 3, 4, 2))),
+        ])
+    elif features == "fourier":
+        print("Log-scaled FFT coefficients")
+        gpu_transform = Compose([
+            FFT((-3, -2), log=True),
+        ])
+    elif features == "all-packets-fourier":
+        print(f"All wavelet packets of level-3 WPT with wavelet={wavelet_name} and boundary={wavelet_boundary} "
+              f"PLUS real and imaginary FFT coefficients")
+        gpu_transform = Compose([
+            WPT2dAll(wavelet_name, 3, mode=wavelet_boundary),  # Dict[str, {raw, (pN, B, 3, pH, pW)}]
+            DictTransformApply("raw", Permute((0, 2, 3, 1))),  # (B, 128, 128, 3)
+            DictTransformClone("raw", "fourier", shallow=True),  # shallow clone pixels to "fourier"
+            DictTransformApply("fourier", FFT((-3, -2), log=True)),  # (B, 128, 128, 3)
+            DictTransformApply("packets1", Permute((1, 0, 3, 4, 2))),  # (B, pN, pH, pW, 3)
+            DictTransformApply("packets2", Permute((1, 0, 3, 4, 2))),
+            DictTransformApply("packets3", Permute((1, 0, 3, 4, 2))),
         ])
 
     for gen in fake_datasets:
@@ -296,7 +343,8 @@ def create_data_loaders(
                 raise RuntimeError("could not infer train/valid/test from file name")
 
     # compute mean/std on train set
-    welford = WelfordEstimator()
+
+    welford = {} if features in ["all-packets", "all-packets-fourier"] else WelfordEstimator()
     transform.set_eval_mode()  # stop randomness
     for batch, _ in DataLoader(ConcatDataset(train_datasets),
                                batch_size=batch_size,
@@ -306,26 +354,40 @@ def create_data_loaders(
         if gpu_transform is not None:
             batch = gpu_transform(batch)
 
-        welford.update(batch)
+        if isinstance(batch, dict):
+            for k, v in batch.items():
+                if k not in welford:
+                    welford[k] = WelfordEstimator()
+                welford[k].update(v)
+        else:
+            welford.update(batch)
         if __debug__:
             print("[DEBUG] break out of mean/std computation")
             break
 
-    mean, std = welford.finalize()
-    print(f"Computed mean/std on train set:\nmean={mean}\nstd={std}")
+    if not isinstance(welford, dict):
+        mean, std = welford.finalize()
+        print(f"Computed mean/std on train set:\nmean={mean}\nstd={std}")
 
-    # append normalize transform
-    if gpu_transform is not None:
-        gpu_transform.append(
-            Normalize(mean=mean.to(dtype=torch.float32, device=device),
-                      std=std.to(dtype=torch.float32, device=device))
-        )
+        # append normalize transform
+        if gpu_transform is not None:
+            gpu_transform.append(
+                Normalize(mean=mean.to(dtype=torch.float32, device=device),
+                          std=std.to(dtype=torch.float32, device=device))
+            )
+        else:
+            transform.extend([
+                ToTensor(),  # because mean/std are tensors
+                Normalize(mean=mean.to(dtype=torch.float32, device=torch.device("cpu")),
+                          std=std.to(dtype=torch.float32, device=torch.device("cpu")))
+            ])
     else:
-        transform.extend([
-            ToTensor(),  # because mean/std are tensors
-            Normalize(mean=mean.to(dtype=torch.float32, device=torch.device("cpu")),
-                      std=std.to(dtype=torch.float32, device=torch.device("cpu")))
-        ])
+        for k, v in welford.items():
+            mean, std = v.finalize()
+            print(f"Computed mean/std on train set for '{k}':\nmean={mean}\nstd={std}")
+
+            gpu_transform.append(DictTransformApply(k, Normalize(mean=mean.to(dtype=torch.float32, device=device),
+                                                                 std=std.to(dtype=torch.float32, device=device))))
 
     transform.set_train_mode()  # reset randomness
 

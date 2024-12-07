@@ -103,6 +103,27 @@ class DictTransformCreate:
         return {key: tf(x) for key, tf in self._transforms.items()}
 
 
+class DictTransformClone:
+    """Clone a named input to a new named output. Performs a deep clone by default."""
+
+    def __init__(self, source: str, clone: str, shallow: bool = False):
+        self._source = source
+        self._clone = clone
+        self._shallow = shallow
+
+    def __call__(self, x: Dict[str, Union[np.ndarray, torch.Tensor]]) -> Dict[str, Union[np.ndarray, torch.Tensor]]:
+        if self._shallow:
+            x[self._clone] = x[self._source]
+        else:
+            if isinstance(x[self._source], np.ndarray):
+                x[self._clone] = np.copy(x[self._source])
+            elif isinstance(x[self._source], torch.Tensor):
+                x[self._clone] = torch.clone(x[self._source].detach())
+            else:
+                raise ValueError(f"expected torch.Tensor or np.ndarray, got {type(x[self._source])}")
+        return x
+
+
 class DictTransformApply:
     """Apply transform on one named input."""
 

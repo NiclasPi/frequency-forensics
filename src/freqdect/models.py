@@ -70,7 +70,8 @@ class CNN(torch.nn.Module):
                 torch.nn.AvgPool2d(2, 2),
             )
             self.scale4 = torch.nn.Sequential(
-                torch.nn.Conv2d(224, 32, 3, 1, padding=1), torch.nn.ReLU()
+                torch.nn.Conv2d(224, 32, 3, 1, padding=1),
+                torch.nn.ReLU(),
             )
             self.linear = torch.nn.Linear(32 * 16 * 16, classes)
         else:
@@ -121,24 +122,24 @@ class CNN(torch.nn.Module):
         else:
             to_net = x
 
-        to_net = to_net.permute([0, 3, 1, 2])
+        to_net = to_net.permute([0, 3, 1, 2])  # (B, 3, H, W)
 
         if self.feature == "all-packets" or self.feature == "all-packets-fourier":
-            res = self.scale1(to_net)
+            res = self.scale1(to_net)  # (B, 8, 128, 128)
             packets = [
                 torch.reshape(
-                    x[key].permute([0, 2, 3, 1, 4]),
-                    [x[key].shape[0], x[key].shape[2], x[key].shape[3], -1],
-                ).permute(0, 3, 1, 2)
-                for key in ["packets1", "packets2", "packets3"]
+                    x[key].permute([0, 2, 3, 1, 4]),  # (B, pH, pW, pN, 3)
+                    [x[key].shape[0], x[key].shape[2], x[key].shape[3], -1],  # (B, pH, pW, pN*3)
+                ).permute(0, 3, 1, 2)  # (B, pN*3, pH, pW)
+                for key in ["packets1", "packets2", "packets3"]  # pN = { 4, 16, 64 } (4^L)
             ]
-            # shape: batch_size, packet_channels, height, widht, color_channels
+            # shape: batch_size, packet_channels, height, width, color_channels
             # cat along channel dim1.
-            to_net = torch.cat([packets[0], res], dim=1)
+            to_net = torch.cat([packets[0], res], dim=1)  # (B, 8+12=20, pH, pW)
             res = self.scale2(to_net)
-            to_net = torch.cat([packets[1], res], dim=1)
+            to_net = torch.cat([packets[1], res], dim=1)  # (B, 16+48=64, pH, pW)
             res = self.scale3(to_net)
-            to_net = torch.cat([packets[2], res], dim=1)
+            to_net = torch.cat([packets[2], res], dim=1)  # (B, 32+192=224, pH, pW)
             out = self.scale4(to_net)
             out = torch.reshape(out, [out.shape[0], -1])
             out = self.linear(out)
